@@ -132,6 +132,15 @@ private:
   std::unique_ptr<const FINUFFT_PLAN_T<TF>> innerT2plan; // ptr used for type 2 in step 2
                                                          // of type 3
 
+  // Type 3 caching: avoid recomputing target-dependent setup when targets unchanged
+  std::vector<TF> invPhiHatCache;                        // cached 1/phiHat per target
+  std::array<BIGINT, 3> nfdim_cached{0, 0, 0};           // cached nf dimensions
+  BIGINT nk_cached = 0;                                  // cached number of target points
+  std::array<TF, 3> S_cached{0, 0, 0};                   // cached target spread (width)
+  std::array<TF, 3> D_cached{0, 0, 0};                   // cached target center
+  std::array<const TF *, 3> STU_cached{nullptr, nullptr, nullptr}; // cached target ptrs
+  bool t3_target_cached = false;                         // whether cache is valid
+
   // other internal structs
   std::unique_ptr<Finufft_FFT_plan<TF>> fftPlan;
 

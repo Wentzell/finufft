@@ -1089,6 +1089,12 @@ int FINUFFT_PLAN_T<TF>::setpts(BIGINT nj, const TF *xj, const TF *yj, const TF *
     for (int idim = dim; idim < 3; ++idim)
       t3P.C[idim] = t3P.D[idim] = 0.0; // their defaults if dim 2 unused, etc
 
+    // Check if target-dependent setup (innerT2plan, invPhiHat) can be reused
+    // Requires: same target pointers, nk, statistics (S, D), and nf dimensions
+    bool targets_unchanged = t3_target_cached && nk == nk_cached && nfdim == nfdim_cached
+                             && S == S_cached && t3P.D == D_cached
+                             && STU_in == STU_cached;
+
     if (nf() * batchSize > MAX_NF) {
       fprintf(stderr,
               "[%s t3] fwBatch would be bigger than MAX_NF, not attempting memory "
@@ -1098,12 +1104,10 @@ int FINUFFT_PLAN_T<TF>::setpts(BIGINT nj, const TF *xj, const TF *yj, const TF *
     }
 
     // alloc rescaled NU src pts x'_j (in X etc), rescaled NU targ pts s'_k ...
-    // We do this by resizing Xp, Yp, and Zp, and pointing X, Y, Z to their data;
-    // this avoids any need for explicit cleanup.
     for (int idim = 0; idim < dim; ++idim) {
       XYZp[idim].resize(nj);
       XYZ[idim] = XYZp[idim].data();
-      STUp[idim].resize(nk);
+      if (!targets_unchanged) STUp[idim].resize(nk);
     }
 
     // always shift as use gam to rescale x_j to x'_j, etc (twist iii)...
@@ -1129,34 +1133,50 @@ int FINUFFT_PLAN_T<TF>::setpts(BIGINT nj, const TF *xj, const TF *yj, const TF *
       for (BIGINT j = 0; j < nj; ++j)
         prephase[j] = {1.0, 0.0}; // *** or keep flag so no mult in exec??
 
-    // create a 1D phihat evaluator
-    Kernel_onedim_FT<TF> onedim_phihat(spopts, horner_coeffs.data(), nc);
-
-    // (old STEP 3a) Compute deconvolution post-factors array (per targ pt)...
-    // (exploits that FT separates because kernel is prod of 1D funcs)
+    // Compute deconvolution post-factors array (per targ pt)
     deconv.resize(nk);
-    // C can be nan or inf if M=0, no input NU pts
     bool Cfinite =
         std::isfinite(t3P.C[0]) && std::isfinite(t3P.C[1]) && std::isfinite(t3P.C[2]);
-    bool Cnonzero = t3P.C[0] != 0.0 || t3P.C[1] != 0.0 || t3P.C[2] != 0.0; // cen
+    bool Cnonzero = t3P.C[0] != 0.0 || t3P.C[1] != 0.0 || t3P.C[2] != 0.0;
     bool do_phase = Cfinite && Cnonzero;
+
+    if (targets_unchanged) {
+      // --- CACHE HIT: reuse invPhiHatCache, only recompute cheap C-dependent phase ---
 #pragma omp parallel for num_threads(opts.nthreads) schedule(static)
-    for (BIGINT k = 0; k < nk; ++k) { // .... loop over NU targ freqs
-      TF phiHat = 1;
-      TF phase  = 0;
-      for (int idim = 0; idim < dim; ++idim) {
-        auto tSTUin = STU_in[idim][k];
-        // rescale the target s_k etc to s'_k etc...
-        auto tSTUp = t3P.h[idim] * t3P.gam[idim] * (tSTUin - t3P.D[idim]); // so |s'_k| <
-                                                                           // pi/R
-        phiHat *= onedim_phihat(tSTUp);
-        if (do_phase) phase += (tSTUin - t3P.D[idim]) * t3P.C[idim];
-        STUp[idim][k] = tSTUp;
+      for (BIGINT k = 0; k < nk; ++k) {
+        if (do_phase) {
+          TF phase = 0;
+          for (int idim = 0; idim < dim; ++idim)
+            phase += (STU_in[idim][k] - t3P.D[idim]) * t3P.C[idim];
+          deconv[k] = std::polar(invPhiHatCache[k], isign * phase);
+        } else {
+          deconv[k] = TC(invPhiHatCache[k]);
+        }
       }
-      deconv[k] = do_phase ? std::polar(TF(1) / phiHat, isign * phase) : TF(1) / phiHat;
+      if (opts.debug)
+        printf("[%s t3] deconv from cache:\t\t%.3g s\n", __func__, timer.elapsedsec());
+    } else {
+      // --- CACHE MISS: compute phiHat and cache 1/phiHat ---
+      Kernel_onedim_FT<TF> onedim_phihat(spopts, horner_coeffs.data(), nc);
+      invPhiHatCache.resize(nk);
+#pragma omp parallel for num_threads(opts.nthreads) schedule(static)
+      for (BIGINT k = 0; k < nk; ++k) { // .... loop over NU targ freqs
+        TF phiHat = 1;
+        TF phase  = 0;
+        for (int idim = 0; idim < dim; ++idim) {
+          auto tSTUin = STU_in[idim][k];
+          auto tSTUp  = t3P.h[idim] * t3P.gam[idim] * (tSTUin - t3P.D[idim]);
+          phiHat *= onedim_phihat(tSTUp);
+          if (do_phase) phase += (tSTUin - t3P.D[idim]) * t3P.C[idim];
+          STUp[idim][k] = tSTUp;
+        }
+        TF invPhiHat       = TF(1) / phiHat;
+        invPhiHatCache[k]  = invPhiHat;
+        deconv[k]          = do_phase ? std::polar(invPhiHat, isign * phase) : TC(invPhiHat);
+      }
+      if (opts.debug)
+        printf("[%s t3] phase & deconv factors:\t%.3g s\n", __func__, timer.elapsedsec());
     }
-    if (opts.debug)
-      printf("[%s t3] phase & deconv factors:\t%.3g s\n", __func__, timer.elapsedsec());
 
     // Set up sort for spreading Cp (from primed NU src pts X, Y, Z) to fw...
     timer.restart();
@@ -1168,37 +1188,46 @@ int FINUFFT_PLAN_T<TF>::setpts(BIGINT nj, const TF *xj, const TF *yj, const TF *
       printf("[%s t3] sort (didSort=%d):\t\t%.3g s\n", __func__, didSort,
              timer.elapsedsec());
 
-    // Plan and setpts once, for the (repeated) inner type 2 finufft call...
-    timer.restart();
-    BIGINT t2nmodes[]   = {nfdim[0], nfdim[1], nfdim[2]}; // t2's input actually fw
-    finufft_opts t2opts = opts;                           // deep copy, since not ptrs
-    t2opts.modeord      = 0;                              // needed for correct t3!
-    t2opts.debug        = std::max(0, opts.debug - 1);    // don't print as much detail
-    t2opts.spread_debug = std::max(0, opts.spread_debug - 1);
-    t2opts.showwarn     = 0;                              // so don't see warnings 2x
-    if (!upsamp_locked)
-      t2opts.upsampfac = 0.0; // if the upsampfac was auto, let inner
-                              // t2 pick it again (from density=nj/Nf)
-    // (...could vary other t2opts here?)
-    // MR: temporary hack, until we have figured out the C++ interface.
-    FINUFFT_PLAN_T<TF> *tmpplan;
-    int ier = finufft_makeplan_t<TF>(2, d, t2nmodes, fftSign, batchSize, tol, &tmpplan,
-                                     &t2opts);
-    if (ier > 1) { // if merely warning, still proceed
-      fprintf(stderr, "[%s t3]: inner type 2 plan creation failed with ier=%d!\n",
-              __func__, ier);
-      return ier;
+    if (!targets_unchanged) {
+      // Plan and setpts for the inner type 2 finufft call...
+      timer.restart();
+      BIGINT t2nmodes[]   = {nfdim[0], nfdim[1], nfdim[2]}; // t2's input actually fw
+      finufft_opts t2opts = opts;                           // deep copy, since not ptrs
+      t2opts.modeord      = 0;                              // needed for correct t3!
+      t2opts.debug        = std::max(0, opts.debug - 1);    // don't print as much detail
+      t2opts.spread_debug = std::max(0, opts.spread_debug - 1);
+      t2opts.showwarn     = 0;                              // so don't see warnings 2x
+      if (!upsamp_locked)
+        t2opts.upsampfac = 0.0; // if the upsampfac was auto, let inner
+                                // t2 pick it again (from density=nj/Nf)
+      // MR: temporary hack, until we have figured out the C++ interface.
+      FINUFFT_PLAN_T<TF> *tmpplan;
+      int ier = finufft_makeplan_t<TF>(2, d, t2nmodes, fftSign, batchSize, tol, &tmpplan,
+                                       &t2opts);
+      if (ier > 1) { // if merely warning, still proceed
+        fprintf(stderr, "[%s t3]: inner type 2 plan creation failed with ier=%d!\n",
+                __func__, ier);
+        return ier;
+      }
+      ier = tmpplan->setpts(nk, STUp[0].data(), STUp[1].data(), STUp[2].data(), 0,
+                            nullptr, nullptr,
+                            nullptr); // note nk = # output points (not nj)
+      innerT2plan.reset(tmpplan);
+      if (ier > 1) {
+        fprintf(stderr, "[%s t3]: inner type 2 setpts failed, ier=%d!\n", __func__, ier);
+        return ier;
+      }
+      if (opts.debug)
+        printf("[%s t3] inner t2 plan & setpts: \t%.3g s\n", __func__, timer.elapsedsec());
+
+      // Cache target statistics for subsequent calls
+      nfdim_cached     = nfdim;
+      nk_cached        = nk;
+      S_cached         = S;
+      D_cached         = t3P.D;
+      STU_cached       = STU_in;
+      t3_target_cached = true;
     }
-    ier = tmpplan->setpts(nk, STUp[0].data(), STUp[1].data(), STUp[2].data(), 0, nullptr,
-                          nullptr,
-                          nullptr); // note nk = # output points (not nj)
-    innerT2plan.reset(tmpplan);
-    if (ier > 1) {
-      fprintf(stderr, "[%s t3]: inner type 2 setpts failed, ier=%d!\n", __func__, ier);
-      return ier;
-    }
-    if (opts.debug)
-      printf("[%s t3] inner t2 plan & setpts: \t%.3g s\n", __func__, timer.elapsedsec());
   }
   return 0;
 }
